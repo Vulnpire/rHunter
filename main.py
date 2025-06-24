@@ -1,14 +1,16 @@
-from burp import IBurpExtender, IHttpListener, ITab, IScanIssue
+from burp import IBurpExtender, IHttpListener, ITab, IScanIssue, IContextMenuFactory
 from java.io import PrintWriter
 from javax.swing import (JPanel, JLabel, JTextField, JButton, BoxLayout, JScrollPane,
                          JTextArea, JCheckBox, SwingConstants)
 from java.awt import BorderLayout, Dimension
+from java.util import ArrayList
+from javax.swing import JMenuItem
 from java.net import URL
 from urllib import quote
 import threading
 import time
 
-class BurpExtender(IBurpExtender, IHttpListener, ITab):
+class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
@@ -36,7 +38,32 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.init_gui()
         callbacks.addSuiteTab(self)
         callbacks.registerHttpListener(self)
+        callbacks.registerContextMenuFactory(self)
         self.update_status("Extension loaded and ready.")
+
+    def createMenuItems(self, invocation):
+        menu = ArrayList()
+        request_responses = invocation.getSelectedMessages()
+        if not request_responses:
+            return None
+
+        menu_item = JMenuItem("Scan this request", actionPerformed=lambda e: self.manual_scan(request_responses[0]))
+        submenu = JMenuItem("Extensions > Open Redirect Hunter > Scan this request")
+        submenu.add(menu_item)
+        menu.add(menu_item)
+        return menu
+
+    def manual_scan(self, messageInfo):
+        try:
+            request_info = self._helpers.analyzeRequest(messageInfo)
+            url = request_info.getUrl()
+            method = request_info.getMethod()
+            param_source = "query" if method == "GET" else "body"
+            self.start_scan_thread(url, messageInfo, param_source)
+            self.update_status("Manual scan started.")
+        except Exception as e:
+            self._stderr.println("[!] Error in manual scan: %s" % str(e))
+            self.update_status("Error during manual scan.")
 
     def load_setting(self, key, default):
         saved = self._callbacks.loadExtensionSetting(key)
@@ -282,3 +309,4 @@ class CustomScanIssue(IScanIssue):
 
     def getHttpService(self):
         return self._httpService
+
