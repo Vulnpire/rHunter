@@ -17,7 +17,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self._stderr = PrintWriter(callbacks.getStderr(), True)
         self._callbacks.setExtensionName("Open Redirect Hunter")
 
-        # Load saved settings or use defaults
+        self.last_request_time = 0
+        self.lock = threading.Lock()
+        self.max_threads = 5
+        self.active_threads = []
+        self.scanned_requests = set()
+
         self.payloads = self.load_setting("payloads", [
             "//evil.com", "///evil.com", "https://evil.com", "http://evil.com",
             "\\\\evil.com\\@good.com", "/\\evil.com/%2f..", "/\\evil.com/%2e%2e",
@@ -25,13 +30,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         ])
         self.keywords = self.load_setting("keywords", ["url", "redirect", "next", "target"])
         self.delay = float(self._callbacks.loadExtensionSetting("delay") or "2.0")
-        self.extension_enabled = (self._callbacks.loadExtensionSetting("enabled") != "false")  # default True
-
-        self.last_request_time = 0
-        self.lock = threading.Lock()
-        self.max_threads = 5
-        self.active_threads = []
-        self.scanned_requests = set()
+        self.extension_enabled = (self._callbacks.loadExtensionSetting("enabled") != "false")
+        self.scan_post_enabled = (self._callbacks.loadExtensionSetting("scan_post") == "true")
 
         self.init_gui()
         callbacks.addSuiteTab(self)
@@ -52,12 +52,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             self.keywords = [k.strip().lower() for k in self.keyword_field.getText().split(',') if k.strip()]
             self.delay = float(self.rate_field.getText().strip())
             self.extension_enabled = self.toggle_checkbox.isSelected()
+            self.scan_post_enabled = self.scan_post_checkbox.isSelected()
 
-            # [Persistent Setting]
             self._callbacks.saveExtensionSetting("payloads", "\n".join(self.payloads))
             self._callbacks.saveExtensionSetting("keywords", ",".join(self.keywords))
             self._callbacks.saveExtensionSetting("delay", str(self.delay))
             self._callbacks.saveExtensionSetting("enabled", "true" if self.extension_enabled else "false")
+            self._callbacks.saveExtensionSetting("scan_post", "true" if self.scan_post_enabled else "false")
 
             self.update_status("Settings saved and persisted.")
         except Exception as e:
@@ -66,7 +67,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
     def toggle_extension(self, event):
         self.extension_enabled = self.toggle_checkbox.isSelected()
-        self._callbacks.saveExtensionSetting("enabled", "true" if self.extension_enabled else "false")  # [Persistent Setting]
+        self._callbacks.saveExtensionSetting("enabled", "true" if self.extension_enabled else "false")
         status = "enabled" if self.extension_enabled else "disabled"
         self.update_status("Extension is now %s." % status)
 
@@ -74,6 +75,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.panel = JPanel(BorderLayout())
         settings_panel = JPanel()
         settings_panel.setLayout(BoxLayout(settings_panel, BoxLayout.Y_AXIS))
+
+        self.scan_post_checkbox = JCheckBox("Scan POST requests", self.scan_post_enabled)
+        settings_panel.add(self.scan_post_checkbox)
 
         settings_panel.add(JLabel("Payloads (one per line):"))
         self.payload_area = JTextArea("\n".join(self.payloads), 8, 50)
@@ -100,7 +104,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.panel.add(settings_panel, BorderLayout.NORTH)
         self.panel.add(self.status_label, BorderLayout.SOUTH)
 
-
     def getTabCaption(self):
         return "Open Redirect Hunter"
 
@@ -119,19 +122,28 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             request_info = self._helpers.analyzeRequest(messageInfo)
             url = request_info.getUrl()
             method = request_info.getMethod()
-            if method != "GET":
+
+            if method == "GET":
+                query = url.getQuery()
+                param_source = "query"
+            elif method == "POST" and self.scan_post_enabled:
+                request_bytes = messageInfo.getRequest()
+                body_offset = request_info.getBodyOffset()
+                body = request_bytes[body_offset:].tostring()
+                query = body
+                param_source = "body"
+            else:
                 return
 
             if not self._callbacks.isInScope(url):
                 return
 
-            query = url.getQuery()
             if not query:
                 return
 
             scanned_any = False
-
-            for param in query.split('&'):
+            param_pairs = query.split('&')
+            for param in param_pairs:
                 key, _, val = param.partition('=')
                 key = key.strip()
                 if any(word in key.lower() for word in self.keywords):
@@ -139,20 +151,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     if key_id not in self.scanned_requests:
                         self.scanned_requests.add(key_id)
                         if not scanned_any:
-                            self.start_scan_thread(url, messageInfo)
+                            self.start_scan_thread(url, messageInfo, param_source)
                             scanned_any = True
         except Exception as e:
             self._stderr.println("[!] Error in processing request: %s" % str(e))
 
-
-    def start_scan_thread(self, url, messageInfo):
+    def start_scan_thread(self, url, messageInfo, param_source):
         with self.lock:
             if len(self.active_threads) >= self.max_threads:
                 return
 
             def runner():
                 try:
-                    self.scan_with_rate_limit(url, messageInfo)
+                    self.scan_with_rate_limit(url, messageInfo, param_source)
                 except Exception as e:
                     self._stderr.println("[!] Thread error: %s" % str(e))
                 finally:
@@ -163,27 +174,32 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             self.active_threads.append(thread)
             thread.start()
 
-    def scan_with_rate_limit(self, url, messageInfo):
+    def scan_with_rate_limit(self, url, messageInfo, param_source):
         with self.lock:
             now = time.time()
             wait = self.delay - (now - self.last_request_time)
             if wait > 0:
                 time.sleep(wait)
             self.last_request_time = time.time()
-        self.scan_for_redirects(url, messageInfo)
+        self.scan_for_redirects(url, messageInfo, param_source)
 
-    def scan_for_redirects(self, base_url, messageInfo):
+    def scan_for_redirects(self, base_url, messageInfo, param_source):
         try:
             parsed = self._helpers.analyzeRequest(messageInfo)
             headers = list(parsed.getHeaders())
             orig_url = base_url.toString()
-            query = base_url.getQuery()
+            if param_source == "query":
+                query = base_url.getQuery()
+            else:
+                request_bytes = messageInfo.getRequest()
+                body_offset = self._helpers.analyzeRequest(messageInfo).getBodyOffset()
+                query = request_bytes[body_offset:].tostring()
+
             found = False
             attempt = 0
 
             self.update_status("Scanning: %s" % base_url)
 
-            # Parse query params into a dict for safe replacement
             params = {}
             for param in query.split('&'):
                 key, sep, val = param.partition('=')
@@ -192,12 +208,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             for payload in self.payloads:
                 for key in params:
                     if any(word in key.lower() for word in self.keywords):
-                        # Replace param value safely
                         new_params = params.copy()
                         new_params[key] = quote(payload)
                         new_query = "&".join("%s=%s" % (k, v) for k, v in new_params.items())
-
-                        # Rebuild URL with new query
                         url_base = orig_url.split('?')[0]
                         new_url_str = url_base + "?" + new_query
                         request = self._helpers.buildHttpRequest(URL(new_url_str))
@@ -244,7 +257,7 @@ class CustomScanIssue(IScanIssue):
         return self._name
 
     def getIssueType(self):
-        return 0x08000000  # Custom issue ID
+        return 0x08000000
 
     def getSeverity(self):
         return self._severity
