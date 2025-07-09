@@ -208,68 +208,70 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             if wait > 0:
                 time.sleep(wait)
             self.last_request_time = time.time()
-        self.scan_for_redirects(url, messageInfo, param_source)
-
+            self.scan_for_redirects(url, messageInfo, param_source)
+            
     def scan_for_redirects(self, base_url, messageInfo, param_source):
         try:
             parsed = self._helpers.analyzeRequest(messageInfo)
             headers = list(parsed.getHeaders())
             orig_url = base_url.toString()
+
             if param_source == "query":
                 query = base_url.getQuery()
             else:
                 request_bytes = messageInfo.getRequest()
                 body_offset = parsed.getBodyOffset()
-                body = request_bytes[body_offset:].tostring()
-                query = body
-
-            found = False
-            attempt = 0
+                body = request_bytes[body_offset:]
+                query = body.decode('utf-8', errors='ignore')
 
             self.update_status("Scanning: %s" % base_url)
 
             params = {}
             for param in query.split('&'):
                 key, sep, val = param.partition('=')
-                params[key] = val
+                if key:  # prevent blank keys
+                    params[key] = val
 
-            for payload in self.payloads:
-                for key in params:
-                    if any(word in key.lower() for word in self.keywords):
-                        new_params = params.copy()
-                        new_params[key] = quote(payload)
-                        new_query = "&".join("%s=%s" % (k, v) for k, v in new_params.items())
-                        url_base = orig_url.split('?')[0]
-                        new_url_str = url_base + "?" + new_query
+            for key in params:
+                if not any(word in key.lower() for word in self.keywords):
+                    continue
 
-                        new_request = self._helpers.buildHttpRequest(URL(new_url_str))
-                        http_service = messageInfo.getHttpService()
-                        response = self._callbacks.makeHttpRequest(http_service, new_request)
-                        analyzed_resp = self._helpers.analyzeResponse(response.getResponse())
+                found = False
+                attempt = 0
 
-                        location_header = None
-                        for header in analyzed_resp.getHeaders():
-                            if header.lower().startswith("location:"):
-                                location_header = header.split(":", 1)[1].strip()
-                                break
+                for payload in self.payloads:
+                    new_params = params.copy()
+                    new_params[key] = quote(payload)
+                    new_query = "&".join("%s=%s" % (k, v) for k, v in new_params.items())
+                    url_base = orig_url.split('?')[0]
+                    new_url_str = url_base + "?" + new_query
 
-                        if location_header and any(p in location_header for p in self.payloads):
-                            self.report_redirect(http_service, new_url_str, response, payload)
-                            self.update_status("Open Redirect found!")
-                            found = True
+                    new_request = self._helpers.buildHttpRequest(URL(new_url_str))
+                    http_service = messageInfo.getHttpService()
+                    response = self._callbacks.makeHttpRequest(http_service, new_request)
+                    analyzed_resp = self._helpers.analyzeResponse(response.getResponse())
+
+                    location_header = None
+                    for header in analyzed_resp.getHeaders():
+                        if header.lower().startswith("location:"):
+                            location_header = header.split(":", 1)[1].strip()
                             break
 
-                        attempt += 1
-                        if found and attempt >= 3:
-                            return
+                    if location_header and any(p in location_header for p in self.payloads):
+                        self.report_redirect(http_service, new_url_str, response, payload)
+                        self.update_status("Open Redirect found!")
+                        found = True
+                        break  # stop scanning this param
 
-            if not found:
-                self.update_status("Finished scan: no open redirect found.")
+                    attempt += 1
+                    if found or attempt >= 3:
+                        break  # stop scanning this param after 3 attempts
+
+            self.update_status("Finished scan: no open redirect found.")
 
         except Exception as e:
             self._stderr.println("[!] Scan error: %s" % str(e))
             self.update_status("Error during scan.")
-
 
     def report_redirect(self, http_service, url_str, response_info, payload):
         issue = CustomScanIssue(
@@ -282,8 +284,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         )
         self._callbacks.addScanIssue(issue)
         self._stdout.println("[+] Open Redirect found: %s -> %s" % (url_str, payload))
-
-
 
 class CustomScanIssue(IScanIssue):
     def __init__(self, httpService, url, httpMessages, name, detail, severity):
@@ -326,4 +326,3 @@ class CustomScanIssue(IScanIssue):
 
     def getHttpService(self):
         return self._httpService
-
