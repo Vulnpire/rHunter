@@ -14,6 +14,7 @@ from javax.swing import (
     JButton, SwingConstants, Box
 )
 from javax.swing.border import TitledBorder, EmptyBorder
+from javax.swing import JToggleButton
 from urllib import quote
 import threading
 import time
@@ -130,19 +131,37 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
         main_panel.add(general_panel)
 
-        # === Payloads Section ===
-        payload_panel = JPanel(BorderLayout())
-        payload_panel.setBorder(TitledBorder("Payloads (one per line)"))
+        # === Payloads Section (Collapsible) ===
+        payload_toggle_panel = JPanel(BorderLayout())
+        payload_toggle_panel.setBorder(TitledBorder("Payloads (click to expand/collapse)"))
 
+        # Toggle button to show/hide payload area
+        self.payload_toggle = JToggleButton("Show Payloads")
+        payload_toggle_panel.add(self.payload_toggle, BorderLayout.NORTH)
+
+        # Payload text area (initially hidden)
         self.payload_area = JTextArea("\n".join(self.payloads), 8, 50)
         self.payload_area.setLineWrap(True)
         self.payload_area.setWrapStyleWord(True)
         scroll_payload = JScrollPane(self.payload_area)
         scroll_payload.setPreferredSize(Dimension(500, 120))
-        payload_panel.add(scroll_payload, BorderLayout.CENTER)
+        scroll_payload.setVisible(False)  # Start collapsed
 
+        payload_toggle_panel.add(scroll_payload, BorderLayout.CENTER)
+
+        # Toggle behavior
+        def toggle_payload_visibility(event):
+            visible = self.payload_toggle.isSelected()
+            scroll_payload.setVisible(visible)
+            self.payload_toggle.setText("Hide Payloads" if visible else "Show Payloads")
+            payload_toggle_panel.revalidate()
+            payload_toggle_panel.repaint()
+
+        self.payload_toggle.addActionListener(toggle_payload_visibility)
+
+        # Add to main panel
         main_panel.add(Box.createVerticalStrut(10))
-        main_panel.add(payload_panel)
+        main_panel.add(payload_toggle_panel)
 
         # === Keywords and Rate Limit ===
         keyword_panel = JPanel(GridLayout(0, 2, 5, 5))
