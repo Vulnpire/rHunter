@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 from burp import IBurpExtender, IHttpListener, ITab, IScanIssue, IContextMenuFactory
 from java.io import PrintWriter
 from javax.swing import (JPanel, JLabel, JTextField, JButton, BoxLayout, JScrollPane,
@@ -6,6 +8,12 @@ from java.awt import BorderLayout, Dimension
 from java.util import ArrayList
 from javax.swing import JMenuItem
 from java.net import URL
+from java.awt import BorderLayout, Dimension, FlowLayout, GridLayout, Font, Color
+from javax.swing import (
+    JPanel, JLabel, JTextArea, JScrollPane, JCheckBox, JTextField,
+    JButton, SwingConstants, Box
+)
+from javax.swing.border import TitledBorder, EmptyBorder
 from urllib import quote
 import threading
 import time
@@ -99,38 +107,75 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.update_status("Extension is now %s." % status)
 
     def init_gui(self):
-        self.panel = JPanel(BorderLayout())
-        settings_panel = JPanel()
-        settings_panel.setLayout(BoxLayout(settings_panel, BoxLayout.Y_AXIS))
 
-        self.scan_post_checkbox = JCheckBox("Scan POST requests", self.scan_post_enabled)
-        settings_panel.add(self.scan_post_checkbox)
+        self.panel = JPanel(BorderLayout(10, 10))
+        self.panel.setBorder(EmptyBorder(10, 10, 10, 10))
 
-        settings_panel.add(JLabel("Payloads (one per line):"))
-        self.payload_area = JTextArea("\n".join(self.payloads), 8, 50)
-        scroll_payload = JScrollPane(self.payload_area)
-        scroll_payload.setPreferredSize(Dimension(500, 100))
-        settings_panel.add(scroll_payload)
+        ## --- Settings Panel ---
+        main_panel = JPanel()
+        main_panel.setLayout(BoxLayout(main_panel, BoxLayout.Y_AXIS))
 
-        settings_panel.add(JLabel("Keywords to watch in query string (comma-separated):"))
-        self.keyword_field = JTextField(", ".join(self.keywords), 50)
-        settings_panel.add(self.keyword_field)
-
-        settings_panel.add(JLabel("Rate Limit (seconds between scans):"))
-        self.rate_field = JTextField(str(self.delay), 5)
-        settings_panel.add(self.rate_field)
+        # === General Options ===
+        general_panel = JPanel(GridLayout(0, 1, 5, 5))
+        general_panel.setBorder(TitledBorder("General Settings"))
 
         self.toggle_checkbox = JCheckBox("Enable Extension", self.extension_enabled)
-        self.toggle_checkbox.addActionListener(self.toggle_extension)
-        settings_panel.add(self.toggle_checkbox)
+        general_panel.add(self.toggle_checkbox)
 
+        self.scan_post_checkbox = JCheckBox("Scan POST requests", self.scan_post_enabled)
+        general_panel.add(self.scan_post_checkbox)
+
+        self.scan_all_checkbox = JCheckBox("Scan all parameters (ignore keyword filtering)", False)
+        general_panel.add(self.scan_all_checkbox)
+
+        main_panel.add(general_panel)
+
+        # === Payloads Section ===
+        payload_panel = JPanel(BorderLayout())
+        payload_panel.setBorder(TitledBorder("Payloads (one per line)"))
+
+        self.payload_area = JTextArea("\n".join(self.payloads), 8, 50)
+        self.payload_area.setLineWrap(True)
+        self.payload_area.setWrapStyleWord(True)
+        scroll_payload = JScrollPane(self.payload_area)
+        scroll_payload.setPreferredSize(Dimension(500, 120))
+        payload_panel.add(scroll_payload, BorderLayout.CENTER)
+
+        main_panel.add(Box.createVerticalStrut(10))
+        main_panel.add(payload_panel)
+
+        # === Keywords and Rate Limit ===
+        keyword_panel = JPanel(GridLayout(0, 2, 5, 5))
+        keyword_panel.setBorder(TitledBorder("Filtering and Timing"))
+
+        keyword_panel.add(JLabel("Keywords to watch (comma-separated):"))
+        self.keyword_field = JTextField(", ".join(self.keywords), 50)
+        keyword_panel.add(self.keyword_field)
+
+        keyword_panel.add(JLabel("Rate Limit (seconds between scans):"))
+        self.rate_field = JTextField(str(self.delay), 5)
+        keyword_panel.add(self.rate_field)
+
+        main_panel.add(Box.createVerticalStrut(10))
+        main_panel.add(keyword_panel)
+
+        # === Save Button ===
+        button_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         self.save_button = JButton("Save Settings", actionPerformed=self.save_settings)
-        settings_panel.add(self.save_button)
+        button_panel.add(self.save_button)
+        main_panel.add(Box.createVerticalStrut(10))
+        main_panel.add(button_panel)
 
+        # === Status Label ===
         self.status_label = JLabel("Status: Ready", SwingConstants.LEFT)
-        self.panel.add(settings_panel, BorderLayout.NORTH)
+        self.status_label.setBorder(EmptyBorder(5, 5, 5, 5))
+        self.status_label.setFont(self.status_label.getFont().deriveFont(Font.BOLD))
+        self.status_label.setForeground(Color(0, 70, 130))
+
+        self.panel.add(main_panel, BorderLayout.CENTER)
         self.panel.add(self.status_label, BorderLayout.SOUTH)
 
+        
     def getTabCaption(self):
         return "Open Redirect Hunter"
 
@@ -226,15 +271,40 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
             self.update_status("Scanning: %s" % base_url)
 
+            # Extract parameters
             params = {}
-            for param in query.split('&'):
-                key, sep, val = param.partition('=')
-                if key:  # prevent blank keys
-                    params[key] = val
+            if query:
+                for param in query.split('&'):
+                    key, sep, val = param.partition('=')
+                    if key:
+                        params[key] = val
 
+            # If no params and "Scan all" is enabled, fuzz the root URL
+            if not params and self.scan_all_checkbox.isSelected():
+                for payload in self.payloads:
+                    new_url_str = base_url.getProtocol() + "://" + base_url.getHost() + base_url.getPath()
+                    if not new_url_str.endswith("/"):
+                        new_url_str += "/"
+                    new_url_str += quote(payload)
+
+                    new_request = self._helpers.buildHttpRequest(URL(new_url_str))
+                    http_service = messageInfo.getHttpService()
+                    response = self._callbacks.makeHttpRequest(http_service, new_request)
+                    analyzed_resp = self._helpers.analyzeResponse(response.getResponse())
+
+                    for header in analyzed_resp.getHeaders():
+                        if header.lower().startswith("location:"):
+                            location = header.split(":", 1)[1].strip()
+                            if any(p in location for p in self.payloads):
+                                self.report_redirect(http_service, new_url_str, response, payload)
+                                self.update_status("Open Redirect found at root!")
+                                return
+
+            # Scan parameters
             for key in params:
-                if not any(word in key.lower() for word in self.keywords):
-                    continue
+                if not self.scan_all_checkbox.isSelected():
+                    if not any(word in key.lower() for word in self.keywords):
+                        continue
 
                 found = False
                 attempt = 0
@@ -244,11 +314,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                     new_params[key] = quote(payload)
                     new_query = "&".join("%s=%s" % (k, v) for k, v in new_params.items())
                     url_base = orig_url.split('?')[0]
-                    new_url_str = url_base + "?" + new_query
+                    new_url_str = url_base + "?" + new_query if param_source == "query" else url_base
 
-                    new_request = self._helpers.buildHttpRequest(URL(new_url_str))
+                    if param_source == "body":
+                        # Rebuild POST request
+                        request = self._helpers.buildHttpMessage(headers, new_query)
+                    else:
+                        # Rebuild GET request
+                        request = self._helpers.buildHttpRequest(URL(new_url_str))
+
                     http_service = messageInfo.getHttpService()
-                    response = self._callbacks.makeHttpRequest(http_service, new_request)
+                    response = self._callbacks.makeHttpRequest(http_service, request)
                     analyzed_resp = self._helpers.analyzeResponse(response.getResponse())
 
                     location_header = None
@@ -261,11 +337,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                         self.report_redirect(http_service, new_url_str, response, payload)
                         self.update_status("Open Redirect found!")
                         found = True
-                        break  # stop scanning this param
+                        break
 
                     attempt += 1
                     if found or attempt >= 3:
-                        break  # stop scanning this param after 3 attempts
+                        break
 
             self.update_status("Finished scan: no open redirect found.")
 
@@ -284,6 +360,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         )
         self._callbacks.addScanIssue(issue)
         self._stdout.println("[+] Open Redirect found: %s -> %s" % (url_str, payload))
+
+
 
 class CustomScanIssue(IScanIssue):
     def __init__(self, httpService, url, httpMessages, name, detail, severity):
