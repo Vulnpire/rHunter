@@ -189,7 +189,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.status_label = JLabel("Status: Ready", SwingConstants.LEFT)
         self.status_label.setBorder(EmptyBorder(5, 5, 5, 5))
         self.status_label.setFont(self.status_label.getFont().deriveFont(Font.BOLD))
-        self.status_label.setForeground(Color(0, 70, 130))
+        self.status_label.setForeground(Color(180, 200, 220))
 
         self.panel.add(main_panel, BorderLayout.CENTER)
         self.panel.add(self.status_label, BorderLayout.SOUTH)
@@ -316,8 +316,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                             location = header.split(":", 1)[1].strip()
                             if any(p in location for p in self.payloads):
                                 self.report_redirect(http_service, new_url_str, response, payload)
-                                self.update_status("Open Redirect found at root!")
-                                return
+                                self.update_status("Open Redirect found at root! Stopping scanning early.")
+                                return  # exit early
 
             # Scan parameters
             for key in params:
@@ -325,9 +325,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                     if not any(word in key.lower() for word in self.keywords):
                         continue
 
-                found = False
                 attempt = 0
-
                 for payload in self.payloads:
                     new_params = params.copy()
                     new_params[key] = quote(payload)
@@ -354,12 +352,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
                     if location_header and any(p in location_header for p in self.payloads):
                         self.report_redirect(http_service, new_url_str, response, payload)
-                        self.update_status("Open Redirect found!")
-                        found = True
-                        break
+                        self.update_status("Open Redirect found! Stopping scanning early.")
+                        return  # exit early after detection
 
                     attempt += 1
-                    if found or attempt >= 3:
+                    if attempt >= 3:
                         break
 
             self.update_status("Finished scan: no open redirect found.")
@@ -368,6 +365,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             self._stderr.println("[!] Scan error: %s" % str(e))
             self.update_status("Error during scan.")
 
+
     def report_redirect(self, http_service, url_str, response_info, payload):
         issue = CustomScanIssue(
             http_service,
@@ -375,12 +373,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             [response_info],
             "Open Redirect",
             "The application redirects to: <b>{}</b>".format(payload),
-            "High"
+            "Medium"
         )
         self._callbacks.addScanIssue(issue)
         self._stdout.println("[+] Open Redirect found: %s -> %s" % (url_str, payload))
-
-
 
 class CustomScanIssue(IScanIssue):
     def __init__(self, httpService, url, httpMessages, name, detail, severity):
