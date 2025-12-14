@@ -376,18 +376,34 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             return saved
         return default
 
+    def parse_int_field(self, text_value, fallback):
+        try:
+            return int(text_value.strip())
+        except Exception:
+            if self.debug_mode:
+                self._stderr.println("[DEBUG] Invalid int input '%s', using fallback %s" % (text_value, str(fallback)))
+            return fallback
+
+    def parse_float_field(self, text_value, fallback):
+        try:
+            return float(text_value.strip())
+        except Exception:
+            if self.debug_mode:
+                self._stderr.println("[DEBUG] Invalid float input '%s', using fallback %s" % (text_value, str(fallback)))
+            return fallback
+
     def save_settings(self, event):
         try:
             self.payloads = [p.strip() for p in self.payload_area.getText().splitlines() if p.strip()]
             self.keywords = [k.strip().lower() for k in self.keyword_field.getText().split(',') if k.strip()]
             self.whitelisted_domains = [d.strip().lower() for d in self.whitelist_area.getText().splitlines() if d.strip()]
-            self.delay = float(self.rate_field.getText().strip())
+            self.delay = self.parse_float_field(self.rate_field.getText() or "0", self.delay)
             self.extension_enabled = self.toggle_checkbox.isSelected()
             self.scan_post_enabled = self.scan_post_checkbox.isSelected()
             self.scan_all_enabled = self.scan_all_checkbox.isSelected()
-            self.recent_proxy_limit = int(self.proxy_limit_field.getText().strip() or "0")
-            self.recent_crawler_limit = int(self.crawler_limit_field.getText().strip() or "0")
-            self.sitemap_batch_size = int(self.sitemap_batch_field.getText().strip() or "0")
+            self.recent_proxy_limit = self.parse_int_field(self.proxy_limit_field.getText() or "0", self.recent_proxy_limit)
+            self.recent_crawler_limit = self.parse_int_field(self.crawler_limit_field.getText() or "0", self.recent_crawler_limit)
+            self.sitemap_batch_size = self.parse_int_field(self.sitemap_batch_field.getText() or "0", self.sitemap_batch_size)
             self.use_dynamic_variants = self.dynamic_variants_checkbox.isSelected()
             self.confirm_redirects = self.confirm_redirects_checkbox.isSelected()
             self.strict_mode = self.strict_mode_checkbox.isSelected()
