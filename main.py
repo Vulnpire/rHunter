@@ -31,7 +31,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self._helpers = callbacks.getHelpers()
         self._stdout = PrintWriter(callbacks.getStdout(), True)
         self._stderr = PrintWriter(callbacks.getStderr(), True)
-        self._callbacks.setExtensionName("Open Redirect Hunter")
+        self._callbacks.setExtensionName("Open Redirect Hunter Pro v3")
 
         self.last_request_time = 0
         self.lock = threading.Lock()
@@ -237,7 +237,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         if not request_responses:
             return None
 
-        menu_item = JMenuItem("Scan with Open Redirect Hunter", 
+        menu_item = JMenuItem("Scan with Open Redirect Hunter Pro v3", 
                             actionPerformed=lambda e: self.manual_scan(request_responses[0]))
         menu.add(menu_item)
         return menu
@@ -538,7 +538,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.panel.add(self.status_label, BorderLayout.SOUTH)
 
     def getTabCaption(self):
-        return "Open Redirect Hunter"
+        return "Open Redirect Hunter Pro v3"
 
     def getUiComponent(self):
         return self.panel
@@ -897,13 +897,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             if not params:
                 return
 
+            is_manual = False  # automatic flow
             scanned_any = False
             for param in params:
                 if param.getType() not in self.param_types_to_scan:
                     continue
 
                 # Respect POST scanning toggle; allow URL params even when POST scanning is off
-                if method == "POST" and not (self.scan_post_checkbox.isSelected() or is_manual) and param.getType() != IParameter.PARAM_URL:
+                if method == "POST" and not self.scan_post_checkbox.isSelected() and param.getType() != IParameter.PARAM_URL:
                     continue
 
                 key_lower = param.getName().lower()
