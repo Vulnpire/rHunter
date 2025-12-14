@@ -31,7 +31,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self._helpers = callbacks.getHelpers()
         self._stdout = PrintWriter(callbacks.getStdout(), True)
         self._stderr = PrintWriter(callbacks.getStderr(), True)
-        self._callbacks.setExtensionName("Open Redirect Hunter Pro v3")
+        self._callbacks.setExtensionName("Open Redirect Hunter")
 
         self.last_request_time = 0
         self.lock = threading.Lock()
@@ -237,7 +237,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         if not request_responses:
             return None
 
-        menu_item = JMenuItem("Scan with Open Redirect Hunter Pro v3", 
+        menu_item = JMenuItem("Scan with Open Redirect Hunter", 
                             actionPerformed=lambda e: self.manual_scan(request_responses[0]))
         menu.add(menu_item)
         return menu
@@ -538,7 +538,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.panel.add(self.status_label, BorderLayout.SOUTH)
 
     def getTabCaption(self):
-        return "Open Redirect Hunter Pro v3"
+        return "Open Redirect Hunter"
 
     def getUiComponent(self):
         return self.panel
