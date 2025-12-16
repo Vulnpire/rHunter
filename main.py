@@ -238,6 +238,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         callbacks.addSuiteTab(self)
         callbacks.registerHttpListener(self)
         callbacks.registerContextMenuFactory(self)
+        try:
+            # Persist initial/load-time settings so runtime flags match UI without user interaction
+            self.save_settings(None)
+        except Exception:
+            pass
         self.update_status("Extension loaded and ready.")
 
     def createMenuItems(self, invocation):
@@ -697,7 +702,26 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
         return "\r\n".join(new_headers) + "\r\n\r\n" + body
 
-    def build_mutated_request(self, orig_request_bytes, param, payload):
+    def ensure_state_query(self, request_str):
+        try:
+            lines = request_str.split("\r\n")
+            if not lines:
+                return request_str
+            request_line = lines[0]
+            parts = request_line.split(" ")
+            if len(parts) < 3:
+                return request_str
+            method, path, proto = parts[0], parts[1], parts[2]
+            if "state=" in path.lower():
+                return request_str
+            sep = "&" if "?" in path else "?"
+            new_path = path + sep + "state=openredirecthunter"
+            lines[0] = "%s %s %s" % (method, new_path, proto)
+            return "\r\n".join(lines)
+        except Exception:
+            return request_str
+
+    def build_mutated_request(self, orig_request_bytes, param, payload, ensure_state=False):
         """
         Build a mutated request that preserves the original method/body and keeps raw payloads intact.
         Falls back to Burp helpers if offsets are unavailable.
@@ -709,7 +733,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             if value_start >= 0 and value_end >= value_start:
                 mutated_str = request_str[:value_start] + payload + request_str[value_end:]
             else:
-                mutated_str = request_str
+                if param.getType() == IParameter.PARAM_URL:
+                    try:
+                        pattern = re.compile(r'(%s=)[^&\s]*' % re.escape(param.getName()))
+                        mutated_str, count = pattern.subn(r'\1' + payload, request_str, count=1)
+                        if count == 0:
+                            mutated_str = request_str
+                    except Exception:
+                        mutated_str = request_str
+                else:
+                    mutated_str = request_str
+
+            if ensure_state:
+                mutated_str = self.ensure_state_query(mutated_str)
 
             body_param_types = set(
                 t for t in [
@@ -791,7 +827,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             return False, None, None
             
         location_lower = location_header.lower()
-        payload_lower = payload.lower()
+        payload_lower = payload.lower() if payload else ""
         try:
             parsed_location = urlparse(location_header)
         except Exception:
@@ -800,6 +836,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         target_scheme = parsed_location.scheme if parsed_location else ""
         target_reg = self.get_registrable_domain(target_host) if target_host else None
         original_reg = self.get_registrable_domain(original_host) if original_host else None
+        payload_location_match = False
         
         # Only consider http/https/protocol-relative redirects
         if target_scheme and target_scheme not in ["http", "https"]:
@@ -831,6 +868,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         # Infer domains from the payload itself
         payload_domains = set()
         def add_payload_host(candidate):
+            if not candidate:
+                return
             variants = set()
             c = candidate.strip()
             variants.add(c)
@@ -858,25 +897,38 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             if target_reg and original_reg and target_reg == original_reg:
                 return False, None, None
 
-            # If host is simply external (different registrable domain) and not whitelisted, treat as open redirect
-            if target_reg and original_reg and target_reg != original_reg and not self.is_host_whitelisted(target_host):
-                return True, "High", "External redirect to %s" % target_host
+            external = target_reg and original_reg and target_reg != original_reg and not self.is_host_whitelisted(target_host)
+            try:
+                decoded_location_lower = decoded_location.lower()
+            except Exception:
+                decoded_location_lower = location_lower
+
+            payload_location_match = False
+            for candidate in [payload_lower, decoded_payload.lower() if decoded_payload else None]:
+                if candidate and candidate.strip() and (candidate in location_lower or candidate in decoded_location_lower):
+                    payload_location_match = True
+                    break
 
             domain_match = False
+            matched_domain = None
             for evil_domain in evil_domains + list(payload_domains):
                 if evil_domain and (host_lower == evil_domain or host_lower.endswith("." + evil_domain)):
                     domain_match = True
                     matched_domain = evil_domain
                     break
 
+            # Avoid flagging legitimate external redirects unless they align with our payload or attacker domains
+            if external and not domain_match and not payload_location_match:
+                return False, None, "External redirect without payload correlation"
+
             if not domain_match:
                 # If parameter name indicates redirect and host is external, treat as open redirect
                 if param_name:
                     pname = param_name.lower()
-                    if any(word in pname for word in self.keywords):
+                    if payload_location_match and any(word in pname for word in self.keywords):
                         return True, "Medium", "External redirect via %s to %s" % (param_name, target_host)
-                # Otherwise, if host is simply external and not whitelisted, flag as medium
-                if target_reg and original_reg and target_reg != original_reg and not self.is_host_whitelisted(target_host):
+                # Otherwise, if host is simply external, only flag when the payload influenced the redirect
+                if external and payload_location_match:
                     return True, "Medium", "External redirect to %s" % target_host
                 return False, None, "Redirect host does not match payload domain"
             else:
@@ -955,12 +1007,45 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                     
         # Check for open redirect to any external domain (not just evil domains) when strict_mode is off
         if self.strict_mode == False and target_host and target_host.lower() != original_host.lower():
-            if "@" in location_header:
-                return True, "Medium", "Potential @ bypass to external domain"
-            if location_header.startswith("//"):
-                return True, "Medium", "Protocol-relative redirect to external domain"
-                
+            if payload_location_match:
+                if "@" in location_header:
+                    return True, "Medium", "Potential @ bypass to external domain"
+                if location_header.startswith("//"):
+                    return True, "Medium", "Protocol-relative redirect to external domain"
+
         return False, None, None
+    
+    def is_external_location(self, original_host, location_header):
+        try:
+            parsed = urlparse(location_header)
+            target_host = parsed.hostname
+            if not target_host:
+                return False, None
+            if self.is_host_whitelisted(target_host):
+                return False, None
+            target_reg = self.get_registrable_domain(target_host)
+            original_reg = self.get_registrable_domain(original_host) if original_host else None
+            if target_reg and original_reg and target_reg != original_reg:
+                return True, target_host
+        except Exception:
+            return False, None
+        return False, None
+    
+    def is_low_signal_path(self, path):
+        if not path:
+            return False
+        p = path.lower()
+        static_exts = (
+            ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+            ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp4", ".mp3",
+            ".json", ".map", ".pdf", ".zip", ".tar", ".gz", ".tgz", ".bz2"
+        )
+        static_segments = ("/static/", "/assets/", "/fonts/", "/img/", "/images/", "/scripts/", "/js/", "/css/", "/media/", "/favicon", "/_next/")
+        if any(p.endswith(ext) for ext in static_exts):
+            return True
+        if any(seg in p for seg in static_segments):
+            return True
+        return False
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         if not self.extension_enabled:
@@ -986,31 +1071,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
                 request_info = self._helpers.analyzeRequest(messageInfo)
                 url = request_info.getUrl()
+                if not self.ignore_scope and url and not self._callbacks.isInScope(url):
+                    return
                 original_host = url.getHost()
+                path = url.getPath() or ""
                 params = request_info.getParameters()
-
-                # If Location already points to an external, non-whitelisted host, raise immediately
-                try:
-                    parsed_loc = urlparse(location)
-                    target_host = parsed_loc.hostname
-                    if target_host and not self.is_host_whitelisted(target_host):
-                        if self.get_registrable_domain(target_host) != self.get_registrable_domain(original_host):
-                            http_service = messageInfo.getHttpService()
-                            self.report_redirect(http_service, url.toString(), messageInfo,
-                                              location, location, "High",
-                                              "Passive external redirect to %s" % target_host)
-                            self._stdout.println("[+] Passive OPEN REDIRECT detected (external host)!")
-                            self._stdout.println("    Location: %s" % location)
-                            self._stdout.println("    Confidence: High")
-                            self.update_status("VULNERABLE (passive external): %s -> %s" % (original_host, target_host), include_stats=True)
-                            # Record key without param context to skip reprocessing
-                            key_id = (url.getHost().lower(), http_service.getPort(), url.getPath(), "passive-external", 0)
-                            self.vulnerable_params.add(key_id)
-                            return
-                except Exception:
-                    pass
+                priority_set = set(p.lower() for p in self.priority_params)
+                has_priority = any((param.getName() or "").lower() in priority_set for param in params) if params else False
 
                 if not params:
+                    return
+
+                if self.is_low_signal_path(path) and not has_priority:
                     return
 
                 for param in params:
@@ -1042,6 +1114,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             request_info = self._helpers.analyzeRequest(messageInfo)
             url = request_info.getUrl()
             method = request_info.getMethod()
+            path = url.getPath() or ""
             http_service = messageInfo.getHttpService()
 
             # Only proceed for GET or POST (with optional POST scanning)
@@ -1066,6 +1139,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             if not params:
                 return
 
+            priority_set = set(p.lower() for p in self.priority_params)
+            has_priority = False
+            for param in params:
+                name_lower = (param.getName() or "").lower()
+                if name_lower in priority_set or any(pr in name_lower for pr in priority_set):
+                    has_priority = True
+                    break
+
+            if self.is_low_signal_path(path) and not has_priority:
+                return
+
             comment = messageInfo.getComment()
             pm_hint = False
             if self.param_miner_enabled and comment:
@@ -1082,7 +1166,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                     continue
 
                 key_lower = param.getName().lower()
-                should_scan = self.scan_all_checkbox.isSelected() or pm_hint or any(word in key_lower for word in self.keywords)
+                is_priority = (key_lower in priority_set) or any(pr in key_lower for pr in priority_set)
+                should_scan = self.scan_all_checkbox.isSelected() or pm_hint or is_priority or any(word in key_lower for word in self.keywords)
                 if not should_scan:
                     continue
 
@@ -1144,6 +1229,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             parsed = self._helpers.analyzeRequest(messageInfo)
             orig_url = base_url.toString()
             original_host = base_url.getHost()
+            path = base_url.getPath() or ""
             method = parsed.getMethod()
             params = parsed.getParameters()
             orig_request_bytes = messageInfo.getRequest()
@@ -1162,6 +1248,16 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             candidate_params = []
             empty_params = []
             priority_set = set(p.lower() for p in self.priority_params)
+            has_priority = False
+            for param in params:
+                name_lower = (param.getName() or "").lower()
+                if name_lower in priority_set or any(pr in name_lower for pr in priority_set):
+                    has_priority = True
+                    # continue scanning to detect state param presence
+
+            if self.is_low_signal_path(path) and not has_priority:
+                self.update_status("Skipping low-signal path %s" % path, include_stats=True)
+                return
 
             for param in params:
                 if param.getType() not in self.param_types_to_scan:
@@ -1172,7 +1268,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                     continue
 
                 name_lower = param.getName().lower()
-                if not self.scan_all_checkbox.isSelected() and not any(word in name_lower for word in self.keywords):
+                is_priority = (name_lower in priority_set) or any(pr in name_lower for pr in priority_set)
+                if not (self.scan_all_checkbox.isSelected() or is_priority or any(word in name_lower for word in self.keywords)):
                     continue
 
                 candidate_params.append(param)
@@ -1228,11 +1325,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             tested_params = set()
             base_checked = set()
 
-            def test_parameter(param, label):
+            def test_parameter(param, label, ensure_state=False):
                 param_key = (param.getName().lower(), param.getType())
                 if param_key in tested_params or vulnerability_found[0]:
                     return
                 tested_params.add(param_key)
+                name_lower_local = param.getName().lower()
+                is_priority = (name_lower_local in priority_set) or any(pr in name_lower_local for pr in priority_set)
 
                 prefix = "!" if label == "empty" else "*"
                 self._stdout.println("[%s] Testing %s parameter '%s' with ALL payloads" % (prefix, label.upper(), param.getName()))
@@ -1252,7 +1351,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                                 fast_payload = original_value
                                 if self.debug_mode:
                                     self._stdout.println("[DEBUG] Fast-path test for %s=%s" % (param.getName(), fast_payload))
-                                mutated_request = self.build_mutated_request(orig_request_bytes, param, fast_payload)
+                                mutated_request = self.build_mutated_request(orig_request_bytes, param, fast_payload, ensure_state=ensure_state)
                                 mutated_url = self._helpers.analyzeRequest(mutated_request).getUrl().toString()
                                 http_service = messageInfo.getHttpService()
                                 response = self._callbacks.makeHttpRequest(http_service, mutated_request)
@@ -1267,6 +1366,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                                                 location = header.split(":", 1)[1].strip()
                                                 break
                                         if location:
+                                            is_external, ext_host = self.is_external_location(original_host, location)
+                                            if is_external and is_priority:
+                                                self.report_redirect(http_service, mutated_url, response,
+                                                                  fast_payload, location, "High",
+                                                                  "External redirect to %s (priority param fast-path)" % ext_host)
+                                                vulnerability_found[0] = True
+                                                self.vulnerable_hosts.add(base_url.getHost().lower())
+                                                self.update_status("VULNERABLE: Open redirect in '%s' on %s (fast-path external)" % (param.getName(), base_url.getHost()), include_stats=True)
+                                                self._stdout.println("[+] OPEN REDIRECT FOUND (fast-path external)!")
+                                                return
+
                                             is_vuln, confidence, reason = self.is_valid_open_redirect(
                                                 location, fast_payload, original_host, param.getName()
                                             )
@@ -1288,7 +1398,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                 try:
                     if param_key not in base_checked:
                         http_service = messageInfo.getHttpService()
-                        resp = self._callbacks.makeHttpRequest(http_service, orig_request_bytes)
+                        baseline_bytes = orig_request_bytes
+                        if ensure_state:
+                            baseline_str = self._helpers.bytesToString(orig_request_bytes)
+                            baseline_bytes = self._helpers.stringToBytes(self.ensure_state_query(baseline_str))
+                        resp = self._callbacks.makeHttpRequest(http_service, baseline_bytes)
                         base_checked.add(param_key)
                         if resp and resp.getResponse():
                             analyzed_base = self._helpers.analyzeResponse(resp.getResponse())
@@ -1300,6 +1414,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                                         base_loc = h.split(":", 1)[1].strip()
                                         break
                                 if base_loc:
+                                    is_external, ext_host = self.is_external_location(original_host, base_loc)
+                                    if is_external and is_priority:
+                                        self.report_redirect(http_service, orig_url, resp,
+                                                          param.getValue(), base_loc, "High",
+                                                          "External redirect to %s (priority param baseline)" % ext_host)
+                                        vulnerability_found[0] = True
+                                        key_id = (base_url.getHost().lower(), messageInfo.getHttpService().getPort(), base_url.getPath(), param.getName().lower(), param.getType())
+                                        self.vulnerable_params.add(key_id)
+                                        self.vulnerable_hosts.add(base_url.getHost().lower())
+                                        self.update_status("VULNERABLE: Open redirect in '%s' on %s (baseline external)" % (param.getName(), base_url.getHost()), include_stats=True)
+                                        self._stdout.println("[+] OPEN REDIRECT FOUND (baseline external)!")
+                                        return
+
                                     is_vuln, confidence, reason = self.is_valid_open_redirect(
                                         base_loc, param.getValue(), original_host, param.getName()
                                     )
@@ -1337,7 +1464,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                     if vulnerability_found[0]:
                         break
                     try:
-                        mutated_request = self.build_mutated_request(orig_request_bytes, param, quick_payload)
+                        mutated_request = self.build_mutated_request(orig_request_bytes, param, quick_payload, ensure_state=ensure_state)
                         mutated_url = self._helpers.analyzeRequest(mutated_request).getUrl().toString()
                         http_service = messageInfo.getHttpService()
                         response = self._callbacks.makeHttpRequest(http_service, mutated_request)
@@ -1352,6 +1479,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                                     location = header.split(":", 1)[1].strip()
                                     break
                             if location:
+                                is_external, ext_host = self.is_external_location(original_host, location)
+                                if is_external and is_priority:
+                                    self.report_redirect(http_service, mutated_url, response, 
+                                                      quick_payload, location, "High", 
+                                                      "External redirect to %s (priority param)" % ext_host)
+                                    vulnerability_found[0] = True
+                                    key_id = (base_url.getHost().lower(), messageInfo.getHttpService().getPort(), base_url.getPath(), param.getName().lower(), param.getType())
+                                    self.vulnerable_params.add(key_id)
+                                    self.vulnerable_hosts.add(base_url.getHost().lower())
+                                    self.update_status("VULNERABLE: Open redirect in '%s' on %s (external quick)" % (param.getName(), base_url.getHost()), include_stats=True)
+                                    self._stdout.println("[+] OPEN REDIRECT FOUND (external quick)!")
+                                    return
+
                                 is_vuln, confidence, reason = self.is_valid_open_redirect(
                                     location, quick_payload, original_host, param.getName()
                                 )
@@ -1367,6 +1507,19 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                                     self.update_status("VULNERABLE: Open redirect in '%s' on %s (quick payload)" % (param.getName(), base_url.getHost()), include_stats=True)
                                     self._stdout.println("[+] OPEN REDIRECT FOUND (quick)!")
                                     return
+                                if is_priority:
+                                    confirmed, note = self.confirm_redirect(location, messageInfo.getHttpService(), orig_request_bytes)
+                                    if confirmed:
+                                        self.report_redirect(http_service, mutated_url, response,
+                                                          quick_payload, location, "High",
+                                                          "Followed redirect: %s" % note)
+                                        vulnerability_found[0] = True
+                                        key_id = (base_url.getHost().lower(), messageInfo.getHttpService().getPort(), base_url.getPath(), param.getName().lower(), param.getType())
+                                        self.vulnerable_params.add(key_id)
+                                        self.vulnerable_hosts.add(base_url.getHost().lower())
+                                        self.update_status("VULNERABLE: Open redirect in '%s' on %s (quick follow)" % (param.getName(), base_url.getHost()), include_stats=True)
+                                        self._stdout.println("[+] OPEN REDIRECT FOUND (quick follow)!")
+                                        return
                     except Exception as e:
                         if self.debug_mode:
                             self._stderr.println("[DEBUG] Quick payload error for %s: %s" % (param.getName(), str(e)))
@@ -1390,7 +1543,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                         ), include_stats=True)
 
                     try:
-                        mutated_request = self.build_mutated_request(orig_request_bytes, param, test_payload)
+                        mutated_request = self.build_mutated_request(orig_request_bytes, param, test_payload, ensure_state=ensure_state)
                         mutated_url = self._helpers.analyzeRequest(mutated_request).getUrl().toString()
                         if self.debug_mode and payload_count <= 3:
                             self._stdout.println("[DEBUG] Testing payload #%d for %s: %s" % (payload_count, param.getName(), test_payload))
@@ -1435,6 +1588,22 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                             continue
 
                         for source, location in redirect_candidates:
+                            is_external, ext_host = self.is_external_location(original_host, location)
+                            if is_external and is_priority:
+                                self._stdout.println("[+] OPEN REDIRECT FOUND (external)!")
+                                self._stdout.println("    Parameter: %s" % param.getName())
+                                self._stdout.println("    Payload: %s" % test_payload)
+                                self._stdout.println("    Location: %s" % location)
+                                self.report_redirect(http_service, mutated_url, response, 
+                                                  test_payload, location, "High", 
+                                                  "External redirect to %s (priority param)" % ext_host)
+                                vulnerability_found[0] = True
+                                key_id = (base_url.getHost().lower(), messageInfo.getHttpService().getPort(), base_url.getPath(), param.getName().lower(), param.getType())
+                                self.vulnerable_params.add(key_id)
+                                self.vulnerable_hosts.add(base_url.getHost().lower())
+                                self.update_status("VULNERABLE: Open redirect in '%s' on %s (external)" % (param.getName(), base_url.getHost()), include_stats=True)
+                                break
+
                             is_vuln, confidence, reason = self.is_valid_open_redirect(
                                 location, test_payload, original_host, param.getName()
                             )
@@ -1462,6 +1631,22 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                                 self.vulnerable_hosts.add(base_url.getHost().lower())
                                 self.update_status("VULNERABLE: Open redirect in '%s' on %s" % (param.getName(), base_url.getHost()), include_stats=True)
                                 break
+                            if is_priority:
+                                confirmed, note = self.confirm_redirect(location, messageInfo.getHttpService(), orig_request_bytes)
+                                if confirmed:
+                                    self._stdout.println("[+] OPEN REDIRECT FOUND (follow)!")
+                                    self._stdout.println("    Parameter: %s" % param.getName())
+                                    self._stdout.println("    Payload: %s" % test_payload)
+                                    self._stdout.println("    Location: %s" % location)
+                                    self.report_redirect(http_service, mutated_url, response, 
+                                                      test_payload, location, "High", 
+                                                      "Followed redirect: %s" % note)
+                                    vulnerability_found[0] = True
+                                    key_id = (base_url.getHost().lower(), messageInfo.getHttpService().getPort(), base_url.getPath(), param.getName().lower(), param.getType())
+                                    self.vulnerable_params.add(key_id)
+                                    self.vulnerable_hosts.add(base_url.getHost().lower())
+                                    self.update_status("VULNERABLE: Open redirect in '%s' on %s (follow)" % (param.getName(), base_url.getHost()), include_stats=True)
+                                    break
                         if vulnerability_found[0]:
                             break
                     except Exception as e:
@@ -1475,7 +1660,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             for param in empty_params:
                 if vulnerability_found[0]:
                     break
-                test_parameter(param, "empty")
+                name_lower = param.getName().lower()
+                is_priority = (name_lower in priority_set) or any(pr in name_lower for pr in priority_set)
+                ensure_state_flag = False
+                test_parameter(param, "empty", ensure_state=ensure_state_flag)
 
             # Then test priority parameters
             if not vulnerability_found[0]:
@@ -1484,8 +1672,11 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                         break
                     if param in empty_params:
                         continue
-                    if param.getName().lower() in priority_set:
-                        test_parameter(param, "priority")
+                    name_lower = param.getName().lower()
+                    is_priority = (name_lower in priority_set) or any(pr in name_lower for pr in priority_set)
+                    ensure_state_flag = False
+                    if is_priority:
+                        test_parameter(param, "priority", ensure_state=ensure_state_flag)
 
             if vulnerability_found[0]:
                 self.update_status("VULNERABLE: Open redirect found on %s" % base_url.getHost(), include_stats=True)
@@ -1502,6 +1693,16 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
     def report_redirect(self, http_service, url_str, response_info, payload, location, confidence, reason):
         severity = "High" if confidence == "High" else "Medium"
+
+        def esc(val):
+            try:
+                return ("" if val is None else str(val)).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            except Exception:
+                return "(unavailable)"
+        
+        payload_safe = esc(payload) or "(empty)"
+        location_safe = esc(location) or "(empty)"
+        reason_safe = esc(reason) or ""
         
         detail = """
         <p>The application appears to be vulnerable to open redirect attacks.</p>
@@ -1510,7 +1711,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         <p><b>Confidence:</b> %s</p>
         <p><b>Detection reason:</b> %s</p>
         <p>An attacker could use this to redirect users to malicious sites while appearing to originate from the legitimate application.</p>
-        """ % (payload, location, confidence, reason)
+        """ % (payload_safe, location_safe, confidence, reason_safe)
         
         issue = CustomScanIssue(
             http_service,
